@@ -1,3 +1,249 @@
+import argparse
+import io
+import math
+import socket
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import numpy as np
+import pybullet as p
+from PIL import Image, ImageDraw
+
+from aco import decode
+from maze import C, GOAL, MAZE, R, START, shortest_length, walk
+
+COLORS = {0: (1.0, 0.1, 0.1), 1: (0.1, 0.35, 1.0), 2: (0.1, 0.75, 0.2)}
+NAMES = {0: "Nodo 0 (rojo)", 1: "Nodo 1 (azul)", 2: "Nodo 2 (verde)"}
+SPEED = 4.0          # celdas por segundo
+IMG = 560            # tamano del video en pixeles
+FPS = 15
+
+lock = threading.Lock()
+best = {}            # id -> {"len", "path", "it"}
+heat = {}            # (fila, col) -> intensidad de feromona
+latest_jpeg = None
+
+
+def world(r, c):
+    """Celda (fila, col) -> coordenadas del mundo (fila 0 arriba)."""
+    return float(c), float(R - 1 - r)
+
+
+# ------------------------------------------------------------------ red
+def udp_listener(port):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", port))
+    print(f"Escuchando UDP en el puerto {port}", flush=True)
+    while True:
+        data, _ = sock.recvfrom(512)
+        msg = decode(data.decode(errors="ignore"))
+        if not msg:
+            continue
+        nid, it, path = msg
+        cells = walk(path)
+        with lock:
+            prev = best.get(nid)
+            best[nid] = {"len": len(path), "path": path, "it": it}
+            if cells and (prev is None or prev["path"] != path or True):
+                for cell in cells[1:]:
+                    heat[cell] = heat.get(cell, 0.0) + 10.0 / len(path)
+
+
+# ------------------------------------------------------------------ video
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        if self.path == "/stream":
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.end_headers()
+            try:
+                while True:
+                    if latest_jpeg:
+                        self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n")
+                        self.wfile.write(latest_jpeg)
+                        self.wfile.write(b"\r\n")
+                    time.sleep(1.0 / FPS)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+        elif self.path == "/frame.jpg":
+            self.send_response(200)
+            self.send_header("Content-Type", "image/jpeg")
+            self.end_headers()
+            self.wfile.write(latest_jpeg or b"")
+        else:
+            html = (
+                "<html><head><title>Gemelo digital ACO</title></head>"
+                "<body style='background:#111;color:#eee;font-family:sans-serif;text-align:center'>"
+                "<h2>Enjambre ACO - gemelo digital (PyBullet)</h2>"
+                "<img src='/stream' style='max-width:95vw'></body></html>"
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(html.encode())
+
+
+def serve_http(port):
+    srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    srv.daemon_threads = True
+    print(f"Visor web en http://localhost:{port}", flush=True)
+    srv.serve_forever()
+
+
+# ------------------------------------------------------------------ escena
+def box(half, pos, rgba):
+    vs = p.createVisualShape(p.GEOM_BOX, halfExtents=half, rgbaColor=rgba)
+    return p.createMultiBody(baseMass=0, baseVisualShapeIndex=vs, basePosition=pos)
+
+
+def build_scene():
+    tiles = {}
+    for r in range(R):
+        for c in range(C):
+            x, y = world(r, c)
+            ch = MAZE[r][c]
+            if ch == "#":
+                box([0.5, 0.5, 0.4], [x, y, 0.4], [0.18, 0.2, 0.28, 1])
+            else:
+                rgba = [0.92, 0.92, 0.92, 1]
+                if (r, c) == START:
+                    rgba = [0.4, 0.9, 0.4, 1]
+                elif (r, c) == GOAL:
+                    rgba = [1.0, 0.85, 0.2, 1]
+                tiles[(r, c)] = box([0.47, 0.47, 0.02], [x, y, 0.02], rgba)
+    return tiles
+
+
+def make_cart(nid):
+    r, g, b = COLORS[nid]
+    vs = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.28, 0.18, 0.08], rgbaColor=[r, g, b, 1])
+    x, y = world(*START)
+    return p.createMultiBody(baseMass=0, baseVisualShapeIndex=vs, basePosition=[x, y, 0.14])
+
+
+class Cart:
+    def __init__(self, nid):
+        self.nid = nid
+        self.body = make_cart(nid)
+        self.cells = [START]
+        self.t = 0.0
+        self.wait = 0.0
+
+    def reload(self):
+        with lock:
+            info = best.get(self.nid)
+        cells = walk(info["path"]) if info else None
+        self.cells = cells or [START]
+        self.t = 0.0
+
+    def update(self, dt):
+        if len(self.cells) < 2:
+            self.reload()
+        else:
+            if self.wait > 0:
+                self.wait -= dt
+                if self.wait <= 0:
+                    self.reload()
+                return
+            self.t += SPEED * dt
+            if self.t >= len(self.cells) - 1:
+                self.t = len(self.cells) - 1
+                self.wait = 1.0
+        i = min(int(self.t), len(self.cells) - 1)
+        j = min(i + 1, len(self.cells) - 1)
+        f = self.t - i
+        x0, y0 = world(*self.cells[i])
+        x1, y1 = world(*self.cells[j])
+        x, y = x0 + (x1 - x0) * f, y0 + (y1 - y0) * f
+        yaw = math.atan2(y1 - y0, x1 - x0) if (x1, y1) != (x0, y0) else 0.0
+        p.resetBasePositionAndOrientation(
+            self.body, [x, y, 0.14], p.getQuaternionFromEuler([0, 0, yaw])
+        )
+
+
+def paint_tiles(tiles):
+    with lock:
+        for k in heat:
+            heat[k] *= 0.97
+        snapshot = dict(heat)
+    top = max(snapshot.values(), default=0.0)
+    for cell, body in tiles.items():
+        if cell in (START, GOAL):
+            continue
+        v = min(1.0, snapshot.get(cell, 0.0) / top) if top > 0.01 else 0.0
+        rgba = [0.92, 0.92 - 0.55 * v, 0.92 - 0.85 * v, 1]
+        p.changeVisualShape(body, -1, rgbaColor=rgba)
+
+
+def render(view, proj):
+    _, _, rgb, _, _ = p.getCameraImage(IMG, IMG, view, proj, renderer=p.ER_TINY_RENDERER)
+    arr = np.reshape(np.array(rgb, dtype=np.uint8), (IMG, IMG, 4))[:, :, :3]
+    img = Image.fromarray(arr)
+    d = ImageDraw.Draw(img)
+    with lock:
+        info = {k: dict(v) for k, v in best.items()}
+    d.rectangle([0, 0, IMG, 18 + 14 * 4], fill=(0, 0, 0))
+    d.text((6, 4), f"Ruta optima (BFS): {shortest_length()} pasos", fill=(255, 255, 255))
+    if not info:
+        d.text((6, 18), "Esperando datos de los nodos...", fill=(255, 200, 80))
+    for nid in range(3):
+        y = 18 + 14 * nid
+        if nid in info:
+            txt = f"{NAMES[nid]}: {info[nid]['len']} pasos (iter {info[nid]['it']})"
+        else:
+            txt = f"{NAMES[nid]}: sin datos"
+        col = tuple(int(255 * v) for v in COLORS[nid])
+        d.text((6, y), txt, fill=col)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=80)
+    return buf.getvalue()
+
+
+def main():
+    global latest_jpeg
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--gui", action="store_true", help="abrir ventana de PyBullet")
+    ap.add_argument("--udp", type=int, default=4210)
+    ap.add_argument("--http", type=int, default=8000)
+    args = ap.parse_args()
+
+    p.connect(p.GUI if args.gui else p.DIRECT)
+    tiles = build_scene()
+    carts = [Cart(i) for i in range(3)]
+
+    threading.Thread(target=udp_listener, args=(args.udp,), daemon=True).start()
+    threading.Thread(target=serve_http, args=(args.http,), daemon=True).start()
+
+    cx, cy = (C - 1) / 2.0, (R - 1) / 2.0
+    dist = max(R, C) * 1.05
+    view = p.computeViewMatrixFromYawPitchRoll([cx, cy, 0], dist, 0, -89.9, 0, 2)
+    proj = p.computeProjectionMatrixFromFOV(60, 1.0, 0.1, 100)
+    if args.gui:
+        p.resetDebugVisualizerCamera(dist, 0, -89.9, [cx, cy, 0])
+
+    last_paint = 0.0
+    last = time.time()
+    while True:
+        now = time.time()
+        dt = now - last
+        last = now
+        for cart in carts:
+            cart.update(dt)
+        if now - last_paint > 0.25:
+            paint_tiles(tiles)
+            last_paint = now
+        if not args.gui:
+            latest_jpeg = render(view, proj)
+        time.sleep(max(0.0, 1.0 / FPS - (time.time() - now)))
+
+
+if __name__ == "__main__":
+    main()
 import argparse, io, math, socket, threading, time
 import numpy as np
 import pybullet as p
