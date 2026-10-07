@@ -1,0 +1,16 @@
+services:
+  twin:
+    build: .
+    ports:
+      - "8000:8000"        # visor web
+      - "4210:4210/udp"    # datos de los ESP32
+
+  emulator:
+    build: .
+    command: python -u emulator.py
+    environment:
+      - TWIN_HOST=twin
+    depends_on:
+      - twin
+    profiles:
+      - emulator           # solo se inicia con --profile emulator
